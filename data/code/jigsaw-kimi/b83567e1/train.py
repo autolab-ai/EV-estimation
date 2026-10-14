@@ -1,0 +1,247 @@
+"""Baseline for jigsaw-toxic-comment-classification-challenge.
+
+Rank-average of three branches, fit per label:
+  (A) word 1-gram (10k) + char_wb 2-6-gram (50k) TF-IDF -> LogisticRegression C=0.1, solver=sag
+  (B) NB-LogReg (Naive-Bayes-weighted features) on word 1-2-gram TF-IDF -> LogisticRegression C=4
+  (F) supervised fastText per label (dim=64, wordNgrams=2, epoch=20, lr=0.5)
+
+Both TF-IDF vectorizers are fit on train+test text, as the source kernels do.
+Deliberately a solid mid-competition solution: linear models on sparse
+n-grams, no neural nets, no pretrained embeddings, no tuning.
+
+Writes submission.csv and submission/submission.csv; the hill's evaluator grades the latter.
+"""
+
+import contextlib
+import gc
+import os
+import re
+import subprocess
+import tempfile
+import time
+
+import numpy as np
+import pandas as pd
+from scipy.sparse import hstack
+from scipy.stats import rankdata
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+
+COMP = "jigsaw-toxic-comment-classification-challenge"
+DATA_DIR = os.environ.get("EV_DATA_DIR", "<DATA_ROOT>")
+PUBLIC = os.path.join(DATA_DIR, COMP, "prepared", "public")
+LABELS = ["toxic", "severe_toxic", "obscene", "threat", "insult", "identity_hate"]
+SEED = 0
+
+# ---------------------------------------------------------------- MLflow (best effort)
+_TRACK = {"on": True}
+
+
+def _start_run():
+    """Attach to the preconfigured MLflow run; never fail the training run."""
+    try:
+        import mlflow  # noqa: F401
+
+        return mlflow.start_run()
+    except Exception as exc:  # pragma: no cover - telemetry only
+        print(f"[mlflow] disabled: {exc}", flush=True)
+        _TRACK["on"] = False
+        return contextlib.nullcontext()
+
+
+def log_params(params):
+    if not _TRACK["on"]:
+        return
+    try:
+        import mlflow
+
+        mlflow.log_params(params)
+    except Exception as exc:  # pragma: no cover
+        print(f"[mlflow] log_params failed, disabling: {exc}", flush=True)
+        _TRACK["on"] = False
+
+
+def log_metric(key, value, step=None):
+    if not _TRACK["on"]:
+        return
+    try:
+        import mlflow
+
+        mlflow.log_metric(key, float(value), step=step)
+    except Exception as exc:  # pragma: no cover
+        print(f"[mlflow] log_metric failed, disabling: {exc}", flush=True)
+        _TRACK["on"] = False
+
+
+def branch_a(train_text, test_text, y):
+    """word + char TF-IDF -> per-label logistic regression."""
+    all_text = pd.concat([train_text, test_text])
+    word = TfidfVectorizer(sublinear_tf=True, strip_accents="unicode", analyzer="word",
+                           token_pattern=r"\w{1,}", stop_words="english",
+                           ngram_range=(1, 1), max_features=10_000)
+    char = TfidfVectorizer(sublinear_tf=True, strip_accents="unicode", analyzer="char_wb",
+                           ngram_range=(2, 6), max_features=50_000)
+    word.fit(all_text)
+    char.fit(all_text)
+    x_tr = hstack([word.transform(train_text), char.transform(train_text)]).tocsr()
+    x_te = hstack([word.transform(test_text), char.transform(test_text)]).tocsr()
+
+    preds = np.zeros((x_te.shape[0], len(LABELS)))
+    for j, lab in enumerate(LABELS):
+        clf = LogisticRegression(C=0.1, solver="sag", max_iter=1000, random_state=SEED)
+        clf.fit(x_tr, y[:, j])
+        preds[:, j] = clf.predict_proba(x_te)[:, 1]
+        print(f"  [A] {lab} done", flush=True)
+    return preds
+
+
+def branch_b(train_text, test_text, y):
+    """Naive-Bayes-weighted features (NB-LogReg) on word 1-2 gram TF-IDF."""
+    all_text = pd.concat([train_text, test_text])
+    vec = TfidfVectorizer(ngram_range=(1, 2), min_df=3, max_df=0.9,
+                          strip_accents="unicode", token_pattern=r"\w{1,}",
+                          sublinear_tf=True, smooth_idf=True, use_idf=True,
+                          max_features=200_000)
+    vec.fit(all_text)
+    x_tr = vec.transform(train_text)
+    x_te = vec.transform(test_text)
+
+    preds = np.zeros((x_te.shape[0], len(LABELS)))
+    for j, lab in enumerate(LABELS):
+        yj = y[:, j]
+        p = (1.0 + np.asarray(x_tr[yj == 1].sum(axis=0))) / (1.0 + (yj == 1).sum())
+        q = (1.0 + np.asarray(x_tr[yj == 0].sum(axis=0))) / (1.0 + (yj == 0).sum())
+        r = np.log(p / q).ravel()
+        clf = LogisticRegression(C=4.0, dual=True, solver="liblinear", random_state=SEED)
+        clf.fit(x_tr.multiply(r).tocsr(), yj)
+        preds[:, j] = clf.predict_proba(x_te.multiply(r).tocsr())[:, 1]
+        print(f"  [B] {lab} done", flush=True)
+    return preds
+
+
+def ft_preprocess(t):
+    """Whitespace-token-friendly text for fastText: lowercase, space-pad
+    every punctuation/symbol char, collapse whitespace (also removes the
+    newlines that model.predict errors on)."""
+    t = t.lower()
+    t = re.sub(r"([^\w\s])", r" \1 ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def branch_f(train_text, test_text, y):
+    """One multi-label supervised fastText model over all six toxicity labels
+    (plus a '__label__clean' class for comments with no label), so embeddings
+    and hashed n-gram weights are shared across attributes in a single
+    training pass (dim=64, word bigrams, softmax loss)."""
+    import fasttext
+
+    ft_train = [ft_preprocess(t) for t in train_text]
+    ft_test = [ft_preprocess(t) for t in test_text]
+
+    fd, tmp = tempfile.mkstemp(prefix="ft_multi_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for i, t in enumerate(ft_train):
+                labs = [LABELS[k] for k in range(len(LABELS)) if y[i, k] == 1]
+                if not labs:
+                    fh.write("__label__clean " + t + "\n")
+                else:
+                    fh.write(" ".join("__label__" + lab for lab in labs) + " " + t + "\n")
+        model = fasttext.train_supervised(
+            input=tmp, dim=64, wordNgrams=2, epoch=20, lr=0.5,
+            minCount=2, bucket=500_000, thread=4, verbose=0,
+            loss="softmax",
+        )
+        labels, probs = model.predict(ft_test, k=len(LABELS) + 1)
+        preds = np.zeros((len(ft_test), len(LABELS)))
+        for i in range(len(ft_test)):
+            d = dict(zip(labels[i], probs[i]))
+            d.pop("__label__clean", None)
+            for j, lab in enumerate(LABELS):
+                preds[i, j] = d.get("__label__" + lab, 0.0)
+        del model
+        gc.collect()
+        print("  [F] multi-label model done", flush=True)
+    finally:
+        os.remove(tmp)
+    return preds
+
+
+def to_rank(p):
+    """Column-wise rank scaled to (0, 1) — AUC only cares about ordering."""
+    out = np.zeros_like(p)
+    for j in range(p.shape[1]):
+        out[:, j] = rankdata(p[:, j]) / (p.shape[0] + 1.0)
+    return out
+
+
+def main():
+    t0 = time.time()
+    log_params({
+        "approach": "rank_avg_word_char_tfidf_logreg + nb_logreg",
+        "seed": SEED,
+        "a_word_max_features": 10_000,
+        "a_char_max_features": 50_000,
+        "a_char_ngram": "2-6",
+        "a_C": 0.1,
+        "a_solver": "sag",
+        "b_max_features": 200_000,
+        "b_ngram": "1-2",
+        "b_min_df": 3,
+        "b_max_df": 0.9,
+        "b_C": 4.0,
+        "b_solver": "liblinear",
+        "f_dim": 64,
+        "f_wordNgrams": 2,
+        "f_epoch": 20,
+        "f_lr": 0.5,
+        "f_minCount": 2,
+        "f_bucket": 500_000,
+        "f_loss": "softmax",
+        "f_mode": "single multi-label model (6 toxicity labels + clean class)",
+        "blend_weights": "1/3 rank average of A/B/F",
+    })
+    # ids are 16-char hex strings — force str so the merge below cannot mis-cast
+    train = pd.read_csv(os.path.join(PUBLIC, "train.csv"), dtype={"id": str})
+    test = pd.read_csv(os.path.join(PUBLIC, "test.csv"), dtype={"id": str})
+    sample = pd.read_csv(os.path.join(PUBLIC, "sample_submission.csv"), dtype={"id": str})
+
+    train_text = train["comment_text"].fillna("unknown")
+    test_text = test["comment_text"].fillna("unknown")
+    y = train[LABELS].values
+
+    pa = branch_a(train_text, test_text, y)
+    ta = time.time() - t0
+    print(f"branch A done at {ta:.0f}s", flush=True)
+    log_metric("branch_a_seconds", ta, step=0)
+    pb = branch_b(train_text, test_text, y)
+    tb = time.time() - t0
+    print(f"branch B done at {tb:.0f}s", flush=True)
+    log_metric("branch_b_seconds", tb - ta, step=0)
+    pf = branch_f(train_text, test_text, y)
+    tf = time.time() - t0
+    print(f"branch F done at {tf:.0f}s", flush=True)
+    log_metric("branch_f_seconds", tf - tb, step=0)
+
+    blend = (to_rank(pa) + to_rank(pb) + to_rank(pf)) / 3.0
+
+    sub = pd.DataFrame(blend, columns=LABELS)
+    sub.insert(0, "id", test["id"].values)
+    # emit rows in sample_submission order, ids as strings (leading-zero hex ids)
+    sub = sample[["id"]].merge(sub, on="id", how="left")
+    assert sub[LABELS].notna().all().all(), "missing predictions for some sample ids"
+    sub.to_csv("submission.csv", index=False)
+    os.makedirs('submission', exist_ok=True)  # the hill grades this directory
+    sub.to_csv(os.path.join('submission', 'submission.csv'), index=False)
+    print(f"submission written at {time.time() - t0:.0f}s, shape={sub.shape}", flush=True)
+
+    # graded by the hill's evaluator on submission/; no in-run grading
+    total = time.time() - t0
+    log_metric("total_seconds", total, step=0)
+    print(f"total wall-clock {total:.0f}s")
+
+
+if __name__ == "__main__":
+    with _start_run():
+        main()

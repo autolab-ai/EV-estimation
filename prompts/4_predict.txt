@@ -1,0 +1,25 @@
+You are an experienced ML research engineer. You will see a Kaggle-style competition, the current working solution (complete code), its graded score, and a proposed change. Runs must finish within 10 minutes of wall-clock on one GPU/CPU node (hard-killed at 15 minutes).
+
+## Competition description
+{the competition's description from MLE-bench}
+
+## Task README (data layout, submission format, constraints)
+{task README}
+
+## Current solution — complete code
+{every code file of the current solution}
+
+## Current graded score
+{score} ({metric name}, {lower or higher} is better)
+
+## Proposed change (exactly as it will be given to the engineer implementing it)
+{idea}
+
+## Implementation (code diff that was actually applied)
+```diff
+{code diff}
+```
+
+Predict what the {metric name} will be after the proposed change is implemented and run once under the stated budget. Changes sometimes improve the metric, sometimes make it worse, and sometimes do nothing — predict honestly, negative outcomes included.
+Respond with ONLY a JSON object, no other text:
+{"predicted_metric": <number>, "predicted_relative_change_percent": <number, positive = improvement, negative = regression>, "one_line_reasoning": "..."}

@@ -1,0 +1,3 @@
+# Keep the baseline environment unchanged by default.
+# Set EV_RUNTIME_CONFIG to a separate TOML file for machine-specific settings.
+[environment]

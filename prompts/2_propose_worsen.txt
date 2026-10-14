@@ -1,0 +1,25 @@
+You are an ML research engineer. Below is a Kaggle-style task, the current working solution, and the metric it achieves. Propose exactly {n} concrete, self-contained ideas to change this solution.
+
+These ideas are for a controlled study of how research changes turn out, which needs examples of changes that do NOT pay off as well as ones that do. So each idea must be a change that, in your best judgement, will make the metric WORSE by a meaningful margin — on the order of a few percent — when it is implemented and run once under the stated budget.
+
+Requirements for each idea:
+- It must be a change a competent researcher might genuinely propose in good faith: a plausible, well-motivated modification of this solution, the kind that looks reasonable on paper and turns out not to work. It must NOT be sabotage: no deliberately broken or buggy code, no absurd hyperparameters, no removal of the submission writing, no training on the wrong labels, nothing that would fail to run or crash.
+- It must be implementable by another engineer from your description alone, without seeing this conversation. Be specific (names of models/features/hyperparameters).
+- Each idea must be ONE atomic change, not a bundle of several changes.
+- It must fit the stated compute and wall-clock budget.
+- Describe only WHAT to change and HOW, with the motivation a proponent of the change would give. Do NOT estimate, predict or mention how much the metric might change, do NOT say or hint in which direction you expect it to go, and do not rank the ideas. The text must read exactly like any other research proposal.
+
+## Task description
+{task description}
+
+## How the change will be evaluated
+{budget}
+
+## Current metric
+{current score}
+
+## Current solution
+{complete code of the current solution}
+
+Respond with ONLY a JSON object, no other text:
+{"ideas": [{"title": "...", "ambition": "safe" or "aggressive", "idea_text": "full self-contained instruction"}]}

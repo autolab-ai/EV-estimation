@@ -1,0 +1,5 @@
+{
+  "device": "cpu",
+  "intraop_threads": 8,
+  "interop_threads": 1
+}

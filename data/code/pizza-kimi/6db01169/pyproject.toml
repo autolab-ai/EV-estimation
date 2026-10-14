@@ -1,0 +1,23 @@
+[project]
+name = "pizza-mid-baseline"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scikit-learn>=1.4",
+    "scipy>=1.11",
+    "sentence-transformers>=2.7",
+    "torch>=2.2",
+]
+
+# CPU-only torch wheels on Linux to keep the install small and CUDA-free.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "platform_system == 'Linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

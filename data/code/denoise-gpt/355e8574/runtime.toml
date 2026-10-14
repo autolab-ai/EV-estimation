@@ -1,0 +1,6 @@
+# CPU-only execution required by the hill. Override this file's location with
+# EV_RUNTIME_CONFIG when using the submission on another machine.
+[environment]
+CUDA_VISIBLE_DEVICES = ""
+OMP_NUM_THREADS = "8"
+MKL_NUM_THREADS = "8"

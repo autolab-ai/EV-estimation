@@ -1,0 +1,16 @@
+{
+  "training": {
+    "loss": "ova",
+    "dim": 64,
+    "epoch": 5,
+    "lr": 0.3,
+    "wordNgrams": 2,
+    "minCount": 2,
+    "minn": 0,
+    "maxn": 0,
+    "bucket": 200000,
+    "thread": 4,
+    "verbose": 0
+  },
+  "prediction_batch_size": 2048
+}

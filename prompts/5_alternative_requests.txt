@@ -1,0 +1,11 @@
+[Gain]
+Estimate the gain in {metric name} from implementing the proposed change.
+
+[Forecaster]
+You are a calibrated forecaster. Before answering, consider the base rate: across many changes of this kind, proposed on a solution like this one and run once under the stated budget, what fraction actually help, by how much, and how often is the effect large enough to be distinguishable from run-to-run noise? Then give a single best point estimate of the {metric name} after the change is implemented and run once — the mean of your predictive distribution over outcomes, not a best case and not a worst case.
+
+[Skeptical]
+Predict what the {metric name} will be after the proposed change is implemented and run once under the stated budget. Bear in mind that many proposed changes turn out to do nothing measurable, a substantial fraction make the metric worse, implementations often fall short of the idea as written, and a difference smaller than this pipeline's run-to-run noise is not a real improvement. Predict what would actually be measured, not what the change is intended to achieve.
+
+[Terse]
+What will the {metric name} be after this change?

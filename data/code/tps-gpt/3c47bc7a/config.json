@@ -1,0 +1,15 @@
+{
+  "data_dir": "<DATA_ROOT>",
+  "torch_num_threads": 4,
+  "torch_num_interop_threads": 1,
+  "batch_size": 4096,
+  "inference_batch_size": 16384,
+  "max_epochs": 50,
+  "early_stopping_patience": 8,
+  "time_limit_seconds": 420,
+  "learning_rate": 0.001,
+  "weight_decay": 0.00001,
+  "lr_factor": 0.5,
+  "lr_patience": 2,
+  "min_lr": 0.00001
+}

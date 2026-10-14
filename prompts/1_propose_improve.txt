@@ -1,0 +1,22 @@
+You are an ML research engineer. Below is a Kaggle-style task, the current working solution, and the metric it achieves. Propose exactly {n} concrete, self-contained ideas to change this solution, aiming to improve the metric.
+
+Requirements for each idea:
+- It must be implementable by another engineer from your description alone, without seeing this conversation. Be specific (names of models/features/hyperparameters).
+- Each idea must be ONE atomic change, not a bundle of several changes.
+- At least one idea should be a safe, incremental change and at least one should be more ambitious.
+- Describe only WHAT to change and HOW. Do NOT estimate, predict, or mention how much the metric might change, and do not rank the ideas.
+
+## Task description
+{task description}
+
+## How the change will be evaluated
+{budget}
+
+## Current metric
+{current score}
+
+## Current solution
+{complete code of the current solution}
+
+Respond with ONLY a JSON object, no other text:
+{"ideas": [{"title": "...", "ambition": "safe" or "aggressive", "idea_text": "full self-contained instruction"}]}

@@ -1,0 +1,7 @@
+{
+  "data_dir": "<DATA_ROOT>",
+  "torch_home": ".cache/torch",
+  "batch_size": 64,
+  "num_workers": 8,
+  "worker_tmp_root": "/tmp"
+}

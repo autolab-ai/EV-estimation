@@ -1,0 +1,282 @@
+"""Baseline for denoising-dirty-documents.
+
+Patch-regression CNN: a small 3-level U-Net is trained with MSE loss on random
+128x128 crops of the (noisy, clean) training pairs and applied to whole test
+images. See README.md for details.
+
+Writes submission.csv and submission/submission.csv; the hill's evaluator grades the latter.
+"""
+
+import math
+import os
+import re
+import subprocess
+import time
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+
+COMP = "denoising-dirty-documents"
+DATA_DIR = os.environ.get("EV_DATA_DIR", "<DATA_ROOT>")
+PUBLIC = os.path.join(DATA_DIR, COMP, "prepared", "public")
+
+
+def cfg_int(name, default):
+    return int(os.environ.get(name, default))
+
+
+def cfg_float(name, default):
+    return float(os.environ.get(name, default))
+
+
+SEED = cfg_int("SEED", 0)
+TRAIN_SECONDS = cfg_int("TRAIN_SECONDS", 330)  # wall-clock training budget
+LOG_EVERY = 100
+BATCH_SIZE = cfg_int("BATCH_SIZE", 32)
+PATCH = cfg_int("PATCH", 128)
+LR = cfg_float("LR", 2e-3)
+BASE_CH = cfg_int("BASE_CH", 32)
+N_VAL = cfg_int("N_VAL", 10)
+
+
+# ---------------------------------------------------------------- mlflow (soft)
+class Tracker:
+    """Best-effort MLflow logging: disables itself on the first failure."""
+
+    def __init__(self):
+        self.ok = False
+        self.ctx = None
+        try:
+            import mlflow
+
+            self.mlflow = mlflow
+            self.ctx = mlflow.start_run()
+            self.ctx.__enter__()
+            self.ok = True
+        except Exception as exc:  # pragma: no cover
+            print(f"[mlflow] disabled: {exc}")
+
+    def log_params(self, params):
+        if not self.ok:
+            return
+        try:
+            self.mlflow.log_params(params)
+        except Exception as exc:
+            print(f"[mlflow] disabled: {exc}")
+            self.ok = False
+
+    def log_metric(self, key, value, step=None):
+        if not self.ok:
+            return
+        try:
+            self.mlflow.log_metric(key, float(value), step=step)
+        except Exception as exc:
+            print(f"[mlflow] disabled: {exc}")
+            self.ok = False
+
+    def close(self):
+        if self.ctx is None:
+            return
+        try:
+            self.ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------- dataset
+def load_gray(path):
+    with Image.open(path) as img:
+        return np.asarray(img.convert("L"), dtype=np.float32) / 255.0
+
+
+def make_input(x):
+    """Stack the noisy image with a median-filter estimate of its background."""
+    u8 = np.rint(x * 255).astype(np.uint8)
+    bg = cv2.medianBlur(u8, 23).astype(np.float32) / 255.0
+    return np.stack([x, bg], axis=0)
+
+
+def load_pairs():
+    names = sorted(os.listdir(os.path.join(PUBLIC, "train")))
+    xs, ys = [], []
+    for n in names:
+        xs.append(make_input(load_gray(os.path.join(PUBLIC, "train", n))))
+        ys.append(load_gray(os.path.join(PUBLIC, "train_cleaned", n)))
+    return names, xs, ys
+
+
+def sample_batch(xs, ys, rng, batch, patch):
+    bx = np.empty((batch, 2, patch, patch), dtype=np.float32)
+    by = np.empty((batch, 1, patch, patch), dtype=np.float32)
+    for i in range(batch):
+        k = rng.integers(len(xs))
+        h, w = xs[k].shape[-2:]
+        r = rng.integers(h - patch + 1)
+        c = rng.integers(w - patch + 1)
+        px = xs[k][:, r:r + patch, c:c + patch]
+        py = ys[k][r:r + patch, c:c + patch]
+        if rng.random() < 0.5:
+            px, py = px[:, :, ::-1], py[:, ::-1]
+        if rng.random() < 0.5:
+            px, py = px[:, ::-1, :], py[::-1]
+        bx[i] = px
+        by[i, 0] = py
+    return torch.from_numpy(bx), torch.from_numpy(by)
+
+
+# ------------------------------------------------------------------------ model
+def block(cin, cout):
+    return nn.Sequential(
+        nn.Conv2d(cin, cout, 3, padding=1, bias=False),
+        nn.BatchNorm2d(cout),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(cout, cout, 3, padding=1, bias=False),
+        nn.BatchNorm2d(cout),
+        nn.ReLU(inplace=True),
+    )
+
+
+class UNet(nn.Module):
+    def __init__(self, ch=32):
+        super().__init__()
+        self.e1 = block(2, ch)
+        self.e2 = block(ch, ch * 2)
+        self.e3 = block(ch * 2, ch * 4)
+        self.d2 = block(ch * 4 + ch * 2, ch * 2)
+        self.d1 = block(ch * 2 + ch, ch)
+        self.out = nn.Conv2d(ch, 1, 1)
+
+    def forward(self, x):
+        e1 = self.e1(x)
+        e2 = self.e2(F.max_pool2d(e1, 2))
+        e3 = self.e3(F.max_pool2d(e2, 2))
+        u2 = F.interpolate(e3, size=e2.shape[-2:], mode="bilinear", align_corners=False)
+        d2 = self.d2(torch.cat([u2, e2], 1))
+        u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
+        d1 = self.d1(torch.cat([u1, e1], 1))
+        return torch.sigmoid(self.out(d1))
+
+
+@torch.no_grad()
+def predict(model, X, device, amp):
+    """Full-image inference on a (2, H, W) input; reflect-pad to a multiple of 8."""
+    h, w = X.shape[-2:]
+    ph, pw = (-h) % 8, (-w) % 8
+    t = torch.from_numpy(np.ascontiguousarray(X))[None].to(device)
+    if ph or pw:
+        t = F.pad(t, (0, pw, 0, ph), mode="reflect")
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+        out = model(t)
+    return out.float()[0, 0, :h, :w].clamp_(0, 1).cpu().numpy()
+
+
+# ------------------------------------------------------------------------- main
+def main():
+    t0 = time.time()
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    rng = np.random.default_rng(SEED)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp = device.type == "cuda"
+    print(f"device={device}")
+
+    tracker = Tracker()
+    tracker.log_params({
+        "model": "unet3", "input": "noisy+median23_bg", "in_ch": 2, "base_ch": BASE_CH, "train_seconds": TRAIN_SECONDS,
+        "batch_size": BATCH_SIZE,
+        "patch": PATCH, "lr": LR, "seed": SEED, "n_val": N_VAL,
+        "loss": "mse", "optimizer": "adam", "sched": "cosine_time",
+    })
+
+    names, xs, ys = load_pairs()
+    n_val = min(N_VAL, len(names) - 1)
+    tr_x, tr_y = xs[:len(xs) - n_val], ys[:len(ys) - n_val]
+    va_x, va_y = xs[len(xs) - n_val:], ys[len(ys) - n_val:]
+    print(f"train={len(tr_x)} val={len(va_x)} shapes={sorted({a.shape[-2:] for a in xs})}")
+
+    model = UNet(BASE_CH).to(device).to(memory_format=torch.channels_last)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+
+    step = 0
+    running = 0.0
+    lr = LR
+    model.train()
+    t_train0 = time.time()
+    while True:
+        frac = min(1.0, (time.time() - t_train0) / TRAIN_SECONDS)
+        if frac >= 1.0:
+            break
+        lr = LR * 0.5 * (1 + math.cos(math.pi * frac))
+        for g in opt.param_groups:
+            g["lr"] = lr
+        bx, by = sample_batch(tr_x, tr_y, rng, BATCH_SIZE, PATCH)
+        bx = bx.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        by = by.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            loss = F.mse_loss(model(bx), by)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        running += loss.item()
+        step += 1
+
+        if step % LOG_EVERY == 0:
+            train_rmse = (running / LOG_EVERY) ** 0.5
+            running = 0.0
+            model.eval()
+            se, cnt = 0.0, 0
+            for a, b in zip(va_x, va_y):
+                p = predict(model, a, device, amp)
+                se += float(((p - b) ** 2).sum())
+                cnt += b.size
+            val_rmse = (se / max(cnt, 1)) ** 0.5
+            model.train()
+            print(f"step={step} lr={lr:.2e} train_rmse={train_rmse:.5f} "
+                  f"val_rmse={val_rmse:.5f} t={time.time() - t0:.0f}s", flush=True)
+            k = step // LOG_EVERY
+            tracker.log_metric("train_rmse", train_rmse, step=k)
+            tracker.log_metric("val_rmse", val_rmse, step=k)
+            tracker.log_metric("lr", lr, step=k)
+    print(f"training done: steps={step} train_time={time.time() - t_train0:.0f}s", flush=True)
+
+    # ------------------------------------------------------------- predictions
+    model.eval()
+    sample = pd.read_csv(os.path.join(PUBLIC, "sampleSubmission.csv"))
+    ids, vals = [], []
+    for fn in sorted(os.listdir(os.path.join(PUBLIC, "test"))):
+        stem = os.path.splitext(fn)[0]
+        img = make_input(load_gray(os.path.join(PUBLIC, "test", fn)))
+        p = predict(model, img, device, amp)
+        h, w = p.shape
+        rows = np.repeat(np.arange(1, h + 1), w)
+        cols = np.tile(np.arange(1, w + 1), h)
+        ids.append(np.char.add(np.char.add(
+            np.full(h * w, stem + "_"), rows.astype(str)),
+            np.char.add(np.full(h * w, "_"), cols.astype(str))))
+        vals.append(p.reshape(-1))
+    pred = pd.Series(np.concatenate(vals), index=np.concatenate(ids))
+    print(f"predicted pixels={len(pred)} expected={len(sample)}")
+
+    aligned = pred.reindex(sample["id"].values)
+    missing = int(aligned.isna().sum())
+    if missing:
+        raise SystemExit(f"{missing} submission ids have no prediction")
+    sub = pd.DataFrame({"id": sample["id"].values,
+                        "value": np.clip(aligned.values, 0.0, 1.0)})
+    sub.to_csv("submission.csv", index=False, float_format="%.5f")
+    os.makedirs('submission', exist_ok=True)  # the hill grades this directory
+    sub.to_csv(os.path.join('submission', 'submission.csv'), index=False, float_format="%.5f")
+    print(f"wrote submission.csv rows={len(sub)} t={time.time() - t0:.0f}s", flush=True)
+
+    # graded by the hill's evaluator on submission/; no in-run grading
+    tracker.close()
+
+
+if __name__ == "__main__":
+    main()

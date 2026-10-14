@@ -1,0 +1,229 @@
+"""Leaf-classification: baseline model + post-hoc probability calibration.
+
+Model is unchanged from the parent (StandardScaler + LogisticRegression(C=1.0,
+max_iter=5000) on the 192 precomputed descriptors). On top, a two-scalar calibration
+layer is fitted on 5-fold out-of-fold predictions:
+
+    Q = P ** a  (row-normalised)      -- power / temperature sharpening
+    Q = (1 - eps) * Q + eps / 99       -- uniform floor
+
+(a, eps) are chosen by grid search to minimise the OOF multi-class log loss, then
+applied to the test probabilities of the model refit on all training rows.
+
+Writes submission.csv and submission/submission.csv; the hill's evaluator grades the latter.
+"""
+
+import contextlib
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import log_loss
+from sklearn.neural_network import MLPClassifier
+from sklearn.exceptions import ConvergenceWarning
+from joblib import Parallel, delayed
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+
+COMP = "leaf-classification"
+DATA_DIR = os.environ.get("EV_DATA_DIR", "<DATA_ROOT>")
+PUBLIC = os.path.join(DATA_DIR, COMP, "prepared", "public")
+SEED = 0
+C = 1.0
+N_SPLITS = 5
+A_GRID = np.arange(0.5, 8.01, 0.1)
+EPS_GRID = [0, 1e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
+# second base model: bag of MLPs blended with the LR before calibration
+MLP_SEEDS = [0, 1, 2, 3, 4]
+ALPHA_GRID = [float(v) for v in os.environ.get("MLP_ALPHA_GRID", "0.1,1.0,10.0").split(",")]
+W_GRID = np.round(np.arange(0.0, 1.01, 0.1), 2)
+MLP_JOBS = int(os.environ.get("MLP_JOBS", "5"))
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+
+# ---------------------------------------------------------------------------
+# best-effort MLflow tracking (never allowed to kill the run)
+class _Tracker:
+    def __init__(self):
+        self.ok = False
+        self.mlflow = None
+        try:
+            import mlflow  # noqa
+            self.mlflow = mlflow
+            self.ok = True
+        except Exception as e:  # pragma: no cover
+            print("mlflow unavailable: %r" % (e,))
+
+    def start_run(self):
+        if not self.ok:
+            return contextlib.nullcontext()
+        try:
+            return self.mlflow.start_run()
+        except Exception as e:
+            print("mlflow start_run failed, continuing untracked: %r" % (e,))
+            self.ok = False
+            return contextlib.nullcontext()
+
+    def log_params(self, d):
+        if not self.ok:
+            return
+        try:
+            self.mlflow.log_params(d)
+        except Exception as e:
+            print("mlflow log_params failed, disabling tracking: %r" % (e,))
+            self.ok = False
+
+    def log_metric(self, k, v, step=None):
+        if not self.ok:
+            return
+        try:
+            self.mlflow.log_metric(k, float(v), step=step)
+        except Exception as e:
+            print("mlflow log_metric failed, disabling tracking: %r" % (e,))
+            self.ok = False
+
+
+def featurize(df):
+    return df[[c for c in df.columns if c not in ("id", "species")]].to_numpy(dtype=np.float64)
+
+
+def make_model():
+    return LogisticRegression(C=C, max_iter=5000, random_state=SEED)
+
+
+def fit_predict(x_tr, y_tr, x_te):
+    scaler = StandardScaler().fit(x_tr)
+    clf = make_model().fit(scaler.transform(x_tr), y_tr)
+    return clf.predict_proba(scaler.transform(x_te)), list(clf.classes_), scaler
+
+
+def _fit_mlp(xs_tr, y_tr, xs_te, alpha, seed, classes):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        mlp = MLPClassifier(hidden_layer_sizes=(512,), activation="relu", solver="adam",
+                            learning_rate_init=1e-3, batch_size=64, max_iter=200,
+                            shuffle=True, early_stopping=False, alpha=alpha,
+                            random_state=seed).fit(xs_tr, y_tr)
+    assert list(mlp.classes_) == classes, "mlp class order mismatch"
+    return mlp.predict_proba(xs_te)
+
+
+def mlp_bag_predict(scaler, x_tr, y_tr, x_te, alpha, classes):
+    xs_tr, xs_te = scaler.transform(x_tr), scaler.transform(x_te)
+    probs = Parallel(n_jobs=MLP_JOBS)(
+        delayed(_fit_mlp)(xs_tr, y_tr, xs_te, alpha, seed, classes) for seed in MLP_SEEDS)
+    return np.mean(probs, axis=0)
+
+
+def calib(P, a, eps):
+    n_cls = P.shape[1]
+    Q = np.clip(P, 1e-12, None) ** a
+    Q /= Q.sum(axis=1, keepdims=True)
+    return (1.0 - eps) * Q + eps / n_cls
+
+
+def main():
+    tracker = _Tracker()
+    with tracker.start_run():
+        tracker.log_params({"model": "StandardScaler+LogisticRegression+MLPbag", "C": C,
+                            "max_iter": 5000, "n_splits": N_SPLITS,
+                            "mlp_hidden": 512, "mlp_seeds": len(MLP_SEEDS),
+                            "mlp_alpha_grid": str(ALPHA_GRID), "w_grid": "0:1:0.1",
+                            "calibration": "power+uniform_floor",
+                            "a_grid": "0.5:8.0:0.1", "eps_grid": str(EPS_GRID)})
+
+        train = pd.read_csv(os.path.join(PUBLIC, "train.csv"))
+        test = pd.read_csv(os.path.join(PUBLIC, "test.csv"))
+        sample = pd.read_csv(os.path.join(PUBLIC, "sample_submission.csv"))
+        classes = [c for c in sample.columns if c != "id"]
+
+        x_all, y_all = featurize(train), train["species"].values
+        x_test = featurize(test)
+        sorted_classes = sorted(np.unique(y_all))
+        n_cls = len(sorted_classes)
+
+        # (1) out-of-fold predictions: LR and, per alpha, the 5-seed MLP bag
+        p_oof = np.zeros((len(y_all), n_cls), dtype=np.float64)
+        p_oof_mlp = {alpha: np.zeros((len(y_all), n_cls), dtype=np.float64) for alpha in ALPHA_GRID}
+        skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+        for fold, (tr_idx, va_idx) in enumerate(skf.split(x_all, y_all)):
+            p_va, cls, scaler = fit_predict(x_all[tr_idx], y_all[tr_idx], x_all[va_idx])
+            assert cls == sorted_classes, "fold missing a class"
+            p_oof[va_idx] = p_va
+            fold_ll = log_loss(y_all[va_idx], p_va, labels=sorted_classes)
+            print("fold %d oof_logloss=%.5f" % (fold, fold_ll))
+            tracker.log_metric("fold_oof_logloss", fold_ll, step=fold)
+            for alpha in ALPHA_GRID:
+                p_m = mlp_bag_predict(scaler, x_all[tr_idx], y_all[tr_idx], x_all[va_idx],
+                                      alpha, sorted_classes)
+                p_oof_mlp[alpha][va_idx] = p_m
+                ll_m = log_loss(y_all[va_idx], p_m, labels=sorted_classes)
+                print("fold %d alpha=%g mlp_oof_logloss=%.5f" % (fold, alpha, ll_m), flush=True)
+
+        raw_oof = log_loss(y_all, p_oof, labels=sorted_classes)
+        print("oof_logloss_uncalibrated=%.5f" % raw_oof)
+        for alpha in ALPHA_GRID:
+            ll_m = log_loss(y_all, p_oof_mlp[alpha], labels=sorted_classes)
+            print("alpha=%g mlp_oof_logloss_uncalibrated=%.5f" % (alpha, ll_m))
+            tracker.log_metric("mlp_oof_logloss_uncalibrated_alpha%g" % alpha, ll_m)
+
+        # (3) grid search over (alpha, w, a, eps); w=0 recovers the LR-only solution
+        def calib_search(P):
+            best = (np.inf, 1.0, 0.0)
+            for a in A_GRID:
+                for eps in EPS_GRID:
+                    ll = log_loss(y_all, calib(P, a, eps), labels=sorted_classes)
+                    if ll < best[0]:
+                        best = (ll, float(a), float(eps))
+            return best
+
+        lr_cal_oof, lr_a, lr_eps = calib_search(p_oof)
+        print("LR-only oof_logloss_calibrated=%.5f  a=%.2f eps=%g" % (lr_cal_oof, lr_a, lr_eps))
+        tracker.log_metric("lr_only_oof_logloss_calibrated", lr_cal_oof)
+
+        best = (lr_cal_oof, ALPHA_GRID[0], 0.0, lr_a, lr_eps)
+        for alpha in ALPHA_GRID:
+            for w in W_GRID:
+                P = (1.0 - w) * p_oof + w * p_oof_mlp[alpha]
+                ll, a, eps = calib_search(P)
+                print("alpha=%g w=%.1f oof_logloss_calibrated=%.5f a=%.2f eps=%g"
+                      % (alpha, w, ll, a, eps))
+                if ll < best[0]:
+                    best = (ll, alpha, float(w), a, eps)
+        cal_oof, best_alpha, best_w, best_a, best_eps = best
+        print("CHOSEN alpha=%g w=%.1f a=%.2f eps=%g  oof_logloss_calibrated=%.5f"
+              % (best_alpha, best_w, best_a, best_eps, cal_oof))
+        tracker.log_metric("oof_logloss_uncalibrated", raw_oof)
+        tracker.log_metric("oof_logloss_calibrated", cal_oof)
+        tracker.log_metric("calib_a", best_a)
+        tracker.log_metric("calib_eps", best_eps)
+        tracker.log_metric("blend_w", best_w)
+        tracker.log_metric("mlp_alpha", best_alpha)
+        tracker.log_metric("local_holdout_logloss", cal_oof)
+
+        # (4) refit on all rows, predict test, calibrate
+        proba, cls, scaler = fit_predict(x_all, y_all, x_test)
+        proba = proba.astype(np.float64)
+        if best_w > 0:
+            p_mlp_test = mlp_bag_predict(scaler, x_all, y_all, x_test, best_alpha, sorted_classes)
+            proba = (1.0 - best_w) * proba + best_w * p_mlp_test
+        proba = calib(proba, best_a, best_eps)
+        proba = np.clip(proba, 1e-15, 1 - 1e-15)
+        proba /= proba.sum(axis=1, keepdims=True)
+        out = pd.DataFrame(proba, columns=cls)
+        for c in classes:
+            if c not in out.columns:
+                out[c] = 0.0
+        sub = pd.concat([pd.DataFrame({"id": test["id"].values}), out[classes]], axis=1)
+        sub.to_csv("submission.csv", index=False)
+        os.makedirs("submission", exist_ok=True)  # the hill grades this directory
+        sub.to_csv(os.path.join("submission", "submission.csv"), index=False)
+        print("wrote submission/submission.csv rows=%d cols=%d" % sub.shape)
+    os.makedirs('submission', exist_ok=True)  # the hill grades this directory
+    sub.to_csv(os.path.join('submission', 'submission.csv'), index=False)
+
+
+if __name__ == "__main__":
+    main()

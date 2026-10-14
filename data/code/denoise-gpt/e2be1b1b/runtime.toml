@@ -1,0 +1,7 @@
+# CPU-only evaluation. Override with EV_RUNTIME_CONFIG for another machine.
+# Thread limits are runtime settings, not model or training hyperparameters.
+[environment]
+CUDA_VISIBLE_DEVICES = ""
+OMP_NUM_THREADS = "8"
+MKL_NUM_THREADS = "8"
+OPENBLAS_NUM_THREADS = "8"

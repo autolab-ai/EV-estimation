@@ -1,0 +1,8 @@
+## Rules
+
+- {CPU only, or one GPU, depending on the task}
+- Aim for under 10 minutes of wall-clock per run; runs are hard-killed at 15 minutes and recorded as failures.
+- Implement ONLY the idea in the experiment description; no unrequested changes.
+- Do NOT search the web for solutions, writeups, notebooks, or leaderboard information about this competition, and do not copy external competition code. Installing packages and downloading standard pretrained weights is allowed.
+- Work ONLY from the code in this experiment branch; do not pull, merge, rebase, cherry-pick, or copy code from main or any other experiment.
+- The run must write submission/submission.csv. The evaluator always runs train.py itself and ignores any submission file that is already in the tree; it computes the score, the run does not report one.

@@ -1,0 +1,6 @@
+{
+  "data_dir": "<DATA_ROOT>",
+  "batch_size": 64,
+  "num_workers": 8,
+  "cpu_threads": 8
+}
